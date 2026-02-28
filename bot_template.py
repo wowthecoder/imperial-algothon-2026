@@ -8,7 +8,12 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from enum import StrEnum
+from enum import Enum
+try:
+    from enum import StrEnum
+except ImportError:  # Python <3.11
+    class StrEnum(str, Enum):
+        pass
 from functools import cached_property
 from threading import Thread
 from traceback import format_exc

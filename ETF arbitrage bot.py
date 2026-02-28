@@ -45,7 +45,9 @@ class ArbOpportunity:
 
 class ArbBot(BaseBot):
     """
-    Polls all 4 orderbooks and fires when a profitable arb exists.
+    Event-driven arb bot: SSE stream maintains in-memory L1 books; arb check
+    fires on each orderbook update, throttled to at most once per poll_interval.
+    No polling REST calls for orderbooks.
     """
 
     def __init__(
@@ -55,7 +57,7 @@ class ArbBot(BaseBot):
         password: str,
         min_edge: float = 3.0,       # minimum profit per unit (tune this!)
         volume: int = 5,             # contracts per arb trade
-        poll_interval: float = 2.0,  # seconds between checks (>= 1.0)
+        poll_interval: float = 2.0,  # minimum seconds between arb checks (>= 1.0)
     ):
         super().__init__(cmi_url, username, password)
         self.min_edge = min_edge
@@ -64,7 +66,11 @@ class ArbBot(BaseBot):
 
         self._lock = threading.Lock()
         self._trading = False        # guard against concurrent arb fires
-        self._running = False
+        self._stop_event = threading.Event()
+
+        # In-memory L1 books, updated by the SSE stream
+        self._books: dict[str, OrderBook] = {}
+        self._last_check: float = 0.0   # monotonic time of last arb check
 
         self.stats = {
             "checks": 0,
@@ -76,7 +82,20 @@ class ArbBot(BaseBot):
     # ── BaseBot callbacks (required) ───────────────────────────────────────────
 
     def on_orderbook(self, orderbook: OrderBook) -> None:
-        pass  # we poll rather than react to avoid feedback loops
+        # Update in-memory L1 book for this symbol
+        self._books[orderbook.product] = orderbook
+
+        # Wait until all 4 books have been seen at least once
+        if not all(s in self._books for s in ALL_SYMBOLS):
+            return
+
+        # Throttle: check at most once per poll_interval
+        now = time.monotonic()
+        if now - self._last_check < self.poll_interval:
+            return
+        self._last_check = now
+
+        self._check_and_trade()
 
     def on_trades(self, trade: Trade) -> None:
         side = "BOUGHT" if trade.buyer == self.username else "SOLD"
@@ -86,16 +105,14 @@ class ArbBot(BaseBot):
 
     def run(self) -> None:
         """Blocking main loop. Ctrl+C to stop."""
-        self.start()  # start SSE for fill notifications
-        self._running = True
-        print(f"[ArbBot] Starting. min_edge={self.min_edge}, volume={self.volume}, "
-              f"poll_interval={self.poll_interval}s")
+        self.start()  # starts SSE thread; orderbook events drive arb checks
+        print(f"[ArbBot] Starting (event-driven). min_edge={self.min_edge}, volume={self.volume}, "
+              f"check_cooldown={self.poll_interval}s")
         print(f"[ArbBot] Watching: {ETF_SYMBOL} vs {' + '.join(COMPONENT_SYMBOLS)}\n")
+        print("[ArbBot] Waiting for SSE orderbook stream...")
 
         try:
-            while self._running:
-                self._check_and_trade()
-                time.sleep(self.poll_interval)
+            self._stop_event.wait()   # block until stop_loop() or KeyboardInterrupt
         except KeyboardInterrupt:
             print("\n[ArbBot] Interrupted — cancelling all orders...")
         finally:
@@ -104,35 +121,9 @@ class ArbBot(BaseBot):
             self._print_stats()
 
     def stop_loop(self) -> None:
-        self._running = False
+        self._stop_event.set()
 
     # ── Core logic ─────────────────────────────────────────────────────────────
-
-    def _fetch_all_orderbooks(self) -> Optional[dict[str, OrderBook]]:
-        """Fetch all 4 orderbooks in parallel. Returns None if any fetch fails."""
-        results: dict[str, OrderBook] = {}
-        errors: list[str] = []
-        lock = threading.Lock()
-
-        def fetch(symbol: str):
-            try:
-                ob = self.get_orderbook(symbol)
-                with lock:
-                    results[symbol] = ob
-            except Exception as e:
-                with lock:
-                    errors.append(f"{symbol}: {e}")
-
-        threads = [Thread(target=fetch, args=(s,)) for s in ALL_SYMBOLS]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        if errors:
-            print(f"[ArbBot] Fetch errors: {errors}")
-            return None
-        return results
 
     def _find_opportunity(self, books: dict[str, OrderBook]) -> Optional[ArbOpportunity]:
         """
@@ -301,9 +292,8 @@ class ArbBot(BaseBot):
     def _check_and_trade(self) -> None:
         self.stats["checks"] += 1
 
-        books = self._fetch_all_orderbooks()
-        if not books:
-            return
+        # Snapshot the in-memory books (populated by SSE events, no REST calls)
+        books = dict(self._books)
 
         # Log mid prices periodically
         if self.stats["checks"] % 10 == 0:
@@ -323,6 +313,10 @@ class ArbBot(BaseBot):
                 return
             self._trading = True
 
+        # Execute in a background thread so we don't block the SSE event loop
+        Thread(target=self._execute_arb_safe, args=(opp,), daemon=True).start()
+
+    def _execute_arb_safe(self, opp: ArbOpportunity) -> None:
         try:
             self._execute_arb(opp)
         finally:
