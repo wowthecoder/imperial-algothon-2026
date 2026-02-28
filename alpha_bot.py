@@ -27,6 +27,7 @@ from threading import Lock, Thread
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from dotenv import load_dotenv
 
 from bot_template import BaseBot, OrderBook, OrderRequest, Side, Trade
 from fair_value import (
@@ -38,40 +39,54 @@ from fair_value import (
     lon_fly_payoff,
 )
 
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+GROUP_A_PRODUCTS: frozenset[str] = frozenset({
+    "TIDE_SPOT", "WX_SPOT", "LHR_COUNT", "LON_ETF",
+})
+
+ETF_ARB_ENABLED = False  # All 4 legs are Group A — disabled
+
 MAX_POSITION: dict[str, int] = {
-    "TIDE_SPOT": 50,
-    "TIDE_SWING": 30,
-    "WX_SPOT":   50,
-    "WX_SUM":    30,
-    "LHR_COUNT": 50,
-    "LHR_INDEX": 30,
-    "LON_ETF":   50,
-    "LON_FLY":   20,
+    "TIDE_SPOT": 0,      # Group A — disabled
+    "TIDE_SWING": 50,    # Group B — increased from 30
+    "WX_SPOT":   0,      # Group A — disabled
+    "WX_SUM":    50,     # Group C — increased from 30
+    "LHR_COUNT": 0,      # Group A — disabled
+    "LHR_INDEX": 50,     # Group D — increased from 30
+    "LON_ETF":   0,      # Group A — disabled
+    "LON_FLY":   30,     # Group E — increased from 20
 }
 
 QUOTE_VOLUME = 5
 
 # Spread half-width (ticks): narrow at high confidence, wide at low
-MIN_SPREAD_TICKS = 3.0
-MAX_SPREAD_TICKS = 10.0
+MIN_SPREAD_TICKS = 2.0
+MAX_SPREAD_TICKS = 8.0
 
 # Minimum FV move to trigger a requote (preserves queue priority)
 REQUOTE_THRESHOLD_TICKS = 1.0
 
 # Hit mispriced orders when they cross our FV by at least this many ticks
-HIT_THRESHOLD_TICKS = 3.0
+HIT_THRESHOLD_TICKS = 2.0
 
 # Don't re-hit same product within this window (SSE fires on every book change)
 HIT_COOLDOWN_SECS = 10.0
-HIT_MIN_CONFIDENCE = 0.25
+HIT_MIN_CONFIDENCE = 0.20
 HIT_POS_LIMIT_FRAC = 0.6
 
 # LON_ETF arb: minimum profit in ticks to trigger
 ARB_TRIGGER_TICKS = 5.0
+
+# Fishing/trap orders: extreme resting limits to catch undisciplined bots
+TRAP_SELL_MULTIPLES = [1.6, 2.0, 3.0]   # sell at 160%, 200%, 300% of FV
+TRAP_BUY_FRACTIONS  = [0.5, 0.2, 0.05]  # buy at 50%, 20%, 5% of FV
+TRAP_VOLUME = 5                          # contracts per trap level
+TRAP_REFRESH_INTERVAL_SECS = 300        # re-place every 5 minutes
 
 DATA_REFRESH_INTERVAL_SECS = 60     # weather + tides
 QUOTING_INTERVAL_SECS = 5
@@ -81,7 +96,7 @@ INVENTORY_SOFT_LIMIT_FRAC = 0.8
 SESSION_START_HOUR = 14
 SESSION_START_MINUTE = 30
 LONDON_TZ = ZoneInfo("Europe/London")
-MID_FILTER_DEBUG = True
+MID_FILTER_DEBUG = False
 MID_FILTER_DEBUG_EVERY_N = 25
 STATE_SAVE_INTERVAL_SECS = 10.0
 STATE_FILE_TEMPLATE = ".alpha_bot_state_{username}.json"
@@ -218,6 +233,8 @@ class AlphaBot(BaseBot):
 
         self._products: dict[str, any] = {}
         self._mid_debug_counts: dict[str, int] = {}
+        self._trap_orders: dict[str, list[str]] = {}   # product → [order_id, ...]
+        self._last_trap_placed: float = 0.0            # monotonic time of last trap refresh
         safe_user = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in username)
         self._state_path = Path(STATE_FILE_TEMPLATE.format(username=safe_user))
         self._state_dirty = False
@@ -234,6 +251,7 @@ class AlphaBot(BaseBot):
         self._load_state()
 
         self.start()   # SSE stream → on_orderbook / on_trades
+        self._unwind_disabled_positions()
 
         Thread(target=self._data_loop, daemon=True).start()
 
@@ -246,6 +264,39 @@ class AlphaBot(BaseBot):
             self.cancel_all_orders()
             self.stop()
             print("AlphaBot stopped.")
+
+    def _unwind_disabled_positions(self):
+        """Cancel orders and flatten positions for disabled Group A products."""
+        print("[UNWIND] Checking Group A positions to flatten...")
+        positions = self.get_positions()
+
+        for sym in GROUP_A_PRODUCTS:
+            orders = self.get_orders(product=sym)
+            for order in orders:
+                self.cancel_order(order["id"])
+            if orders:
+                print(f"[UNWIND] Cancelled {len(orders)} orders on {sym}")
+
+            pos = positions.get(sym, 0)
+            if pos == 0:
+                continue
+
+            try:
+                ob = self.get_orderbook(sym)
+                if pos > 0:
+                    bid = _best_bid(ob)
+                    if bid is not None:
+                        self.send_order(OrderRequest(sym, bid, Side.SELL, abs(pos)))
+                        print(f"[UNWIND] Flattening {sym}: SELL {abs(pos)}@{bid}")
+                else:
+                    ask = _best_ask(ob)
+                    if ask is not None:
+                        self.send_order(OrderRequest(sym, ask, Side.BUY, abs(pos)))
+                        print(f"[UNWIND] Flattening {sym}: BUY {abs(pos)}@{ask}")
+            except Exception as e:
+                print(f"[UNWIND] Failed to flatten {sym}: {e}")
+
+        print("[UNWIND] Done.")
 
     # ------------------------------------------------------------------
     # SSE callbacks
@@ -548,6 +599,11 @@ class AlphaBot(BaseBot):
 
                 self._check_etf_arb()
 
+                now = time.monotonic()
+                if now - self._last_trap_placed >= TRAP_REFRESH_INTERVAL_SECS:
+                    self._refresh_traps(live_fv)
+                    self._last_trap_placed = now
+
             except Exception as e:
                 print(f"[QUOTE ERROR] {e}")
 
@@ -561,6 +617,9 @@ class AlphaBot(BaseBot):
         live_fv: dict[str, float],
         model: FairValueEstimate,
     ):
+        if symbol in GROUP_A_PRODUCTS:
+            return
+
         fv = live_fv.get(symbol)
         if fv is None or fv <= 0:
             return
@@ -628,6 +687,8 @@ class AlphaBot(BaseBot):
 
     def _check_etf_arb(self):
         """Pure arb: LON_ETF should equal TIDE_SPOT + WX_SPOT + LHR_COUNT at settlement."""
+        if not ETF_ARB_ENABLED:
+            return
         with self._lock:
             obs = {sym: self._orderbooks.get(sym)
                    for sym in ["LON_ETF", "TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]}
@@ -687,6 +748,68 @@ class AlphaBot(BaseBot):
             self.send_orders(orders)
         else:
             print("[ARB] Skipped: position limit on one or more legs")
+
+    # ------------------------------------------------------------------
+    # Trap orders — extreme resting limits to catch undisciplined bots
+    # ------------------------------------------------------------------
+
+    def _refresh_traps(self, live_fv: dict[str, float]) -> None:
+        """Cancel and re-place extreme resting limit orders for active products.
+
+        Any bot that crosses the spread without price discipline will fill against
+        these, handing us large instant PnL. Normal bots with proper risk management
+        will never touch them.
+        """
+        with self._lock:
+            positions = dict(self._positions)
+
+        for sym, product in self._products.items():
+            if sym in GROUP_A_PRODUCTS:
+                continue
+            fv = live_fv.get(sym)
+            if not fv or fv <= 0:
+                continue
+
+            max_pos = MAX_POSITION.get(sym, 0)
+            if max_pos == 0:
+                continue
+
+            tick = product.tickSize
+            pos = positions.get(sym, 0)
+
+            # Cancel old trap orders (no-op if already filled)
+            for oid in self._trap_orders.get(sym, []):
+                self.cancel_order(oid)
+
+            trap_orders: list[OrderRequest] = []
+
+            # Extreme SELL traps — catch buyers with no price cap
+            sell_capacity = max_pos + pos   # how much further short we can go
+            if sell_capacity > 0:
+                for mult in TRAP_SELL_MULTIPLES:
+                    price = round(fv * mult / tick) * tick
+                    vol = min(TRAP_VOLUME, sell_capacity)
+                    trap_orders.append(OrderRequest(sym, price, Side.SELL, vol))
+
+            # Extreme BUY traps — catch sellers with no price floor
+            buy_capacity = max_pos - pos    # how much further long we can go
+            if buy_capacity > 0:
+                for frac in TRAP_BUY_FRACTIONS:
+                    price = max(tick, round(fv * frac / tick) * tick)
+                    vol = min(TRAP_VOLUME, buy_capacity)
+                    trap_orders.append(OrderRequest(sym, price, Side.BUY, vol))
+
+            if not trap_orders:
+                self._trap_orders[sym] = []
+                continue
+
+            results = self.send_orders(trap_orders)
+            self._trap_orders[sym] = [r.id for r in results if r is not None]
+            print(
+                f"[TRAP] {sym}: {len(self._trap_orders[sym])} orders placed "
+                f"(sells @{[round(fv*m) for m in TRAP_SELL_MULTIPLES]}, "
+                f"buys @{[max(1, round(fv*f)) for f in TRAP_BUY_FRACTIONS]})"
+            )
 
     # ------------------------------------------------------------------
     # Local state persistence
@@ -775,22 +898,12 @@ class AlphaBot(BaseBot):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # EXCHANGE_URL    = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-    EXCHANGE_URL  = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/"
+    EXCHANGE_URL = os.getenv("CMI_URL_CHALLENGE", "")
+    USERNAME = os.getenv("CMI_USERNAME_CHALLENGE", "")
+    PASSWORD = os.getenv("CMI_PASSWORD_CHALLENGE", "")
+    AERODATABOX_KEY = os.getenv("AERODATABOX_KEY", "")
 
-    USERNAME        = "Stack_Overslept"
-    PASSWORD        = "JKVM2026"
-    # USERNAME = "jingloo-test"
-    # PASSWORD = "JingCMI123"
-    AERODATABOX_KEY = "07ee7d05eamshc9db0bf5c17f962p13157ejsn762d96e7aa7e"
-
-    session_start_env = os.getenv("SESSION_START")
-    if session_start_env:
-        SESSION_START = datetime.fromisoformat(session_start_env)
-        if SESSION_START.tzinfo is None:
-            SESSION_START = SESSION_START.replace(tzinfo=LONDON_TZ)
-    else:
-        SESSION_START = resolve_session_start()
+    SESSION_START = resolve_session_start()
 
     bot = AlphaBot(
         cmi_url=EXCHANGE_URL,

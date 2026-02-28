@@ -15,6 +15,9 @@ from threading import Lock, Thread
 from typing import Any
 
 from bot_template import BaseBot, OrderBook, OrderRequest, Side, Trade
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Strategy configuration
@@ -29,6 +32,8 @@ MAX_HALF_SPREAD_TICKS = 8.0
 INVENTORY_SKEW_TICKS = 6.0
 INVENTORY_SOFT_LIMIT_FRAC = 0.85
 STALE_BOOK_SECS = 20.0
+PNL_DEBUG_ENABLED = True
+PNL_DEBUG_INTERVAL_SECS = 30.0
 
 DEFAULT_MAX_POSITION = 40
 MAX_POSITION: dict[str, int] = {
@@ -100,6 +105,8 @@ class LiquidityProviderBot(BaseBot):
         self._book_updated_at: dict[str, float] = {}
         self._active_orders: dict[str, list[str]] = {}
         self._last_quotes: dict[str, tuple[float, float]] = {}
+        self._last_pnl_debug = 0.0
+        self._logged_unknown_pnl_shape = False
 
     def run(self) -> None:
         print("LiquidityProviderBot starting...")
@@ -159,6 +166,8 @@ class LiquidityProviderBot(BaseBot):
 
                 for symbol, product in self._products.items():
                     self._requote_symbol(symbol, product)
+
+                self._maybe_print_pnl_debug()
             except Exception as e:
                 print(f"[QUOTE ERROR] {e}")
             time.sleep(self._quote_interval_secs)
@@ -269,20 +278,129 @@ class LiquidityProviderBot(BaseBot):
         with self._lock:
             self._active_orders[symbol] = []
 
+    # ------------------------------------------------------------------
+    # Debug: historical PnL per instrument
+    # ------------------------------------------------------------------
+
+    def _maybe_print_pnl_debug(self) -> None:
+        if not PNL_DEBUG_ENABLED:
+            return
+        now = time.monotonic()
+        if now - self._last_pnl_debug < PNL_DEBUG_INTERVAL_SECS:
+            return
+        self._last_pnl_debug = now
+
+        try:
+            pnl_payload = self.get_pnl()
+        except Exception as e:
+            print(f"[PNL DEBUG] get_pnl failed: {e}")
+            return
+
+        per_symbol = self._extract_per_symbol_pnl(pnl_payload)
+        if per_symbol:
+            print("\n[PNL] Historical PnL per instrument")
+            ordered = list(self._products.keys()) if self._products else sorted(per_symbol.keys())
+            for symbol in ordered:
+                if symbol in per_symbol:
+                    print(f"  {symbol:<12} {per_symbol[symbol]:>10.2f}")
+            extras = [s for s in per_symbol.keys() if s not in ordered]
+            for symbol in sorted(extras):
+                print(f"  {symbol:<12} {per_symbol[symbol]:>10.2f}")
+            return
+
+        if self._logged_unknown_pnl_shape:
+            return
+        self._logged_unknown_pnl_shape = True
+        if isinstance(pnl_payload, dict):
+            preview = f"keys={list(pnl_payload.keys())[:10]}"
+        elif isinstance(pnl_payload, list):
+            preview = f"list_len={len(pnl_payload)}"
+        else:
+            preview = f"type={type(pnl_payload).__name__}"
+        print(f"[PNL DEBUG] Could not parse per-instrument historical PnL from payload ({preview})")
+
+    def _extract_per_symbol_pnl(self, payload: Any) -> dict[str, float]:
+        out: dict[str, float] = {}
+
+        def to_float(v: Any) -> float | None:
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                try:
+                    return float(v)
+                except ValueError:
+                    return None
+            return None
+
+        def pick_symbol(d: dict[str, Any]) -> str | None:
+            for key in ("product", "symbol", "productSymbol", "instrument"):
+                val = d.get(key)
+                if isinstance(val, str) and val:
+                    return val
+            return None
+
+        def pick_pnl_value(d: dict[str, Any]) -> float | None:
+            for key in (
+                "historicalPnl",
+                "historicPnl",
+                "totalPnl",
+                "netPnl",
+                "realizedPnl",
+                "pnl",
+                "profit",
+            ):
+                if key in d:
+                    val = to_float(d.get(key))
+                    if val is not None:
+                        return val
+            return None
+
+        def consume_list(items: list[Any]) -> None:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                sym = pick_symbol(item)
+                pnl = pick_pnl_value(item)
+                if sym and pnl is not None:
+                    out[sym] = pnl
+
+        if isinstance(payload, list):
+            consume_list(payload)
+            return out
+
+        if not isinstance(payload, dict):
+            return out
+
+        # Direct map shape: {"TIDE_SPOT": 12.3, ...} or {"TIDE_SPOT": {"pnl":12.3}, ...}
+        for key, val in payload.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(val, dict):
+                pnl = pick_pnl_value(val)
+                if pnl is not None:
+                    out[key] = pnl
+            else:
+                pnl = to_float(val)
+                if pnl is not None and key.isupper():
+                    out[key] = pnl
+
+        # Nested list shape: {"products":[{"product":"TIDE_SPOT","historicalPnl":...}, ...]}
+        for val in payload.values():
+            if isinstance(val, list):
+                consume_list(val)
+
+        return out
+
 
 if __name__ == "__main__":
-    # Set via environment variables for safety:
-    #   export CMI_URL=http://ec2-xx-xx-xx-xx.eu-west-1.compute.amazonaws.com/
-    #   export CMI_USERNAME=your_username
-    #   export CMI_PASSWORD=your_password
-    exchange_url = os.getenv("CMI_URL", "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/")
-    username = os.getenv("CMI_USERNAME", "your_username")
-    password = os.getenv("CMI_PASSWORD", "your_password")
+    EXCHANGE_URL = os.getenv("CMI_URL_TEST", "")
+    USERNAME = os.getenv("CMI_USERNAME_TEST", "")
+    PASSWORD = os.getenv("CMI_PASSWORD_TEST", "")
 
     bot = LiquidityProviderBot(
-        cmi_url=exchange_url,
-        username=username,
-        password=password,
+        cmi_url=EXCHANGE_URL,
+        username=USERNAME,
+        password=PASSWORD,
         quote_size=QUOTE_SIZE,
         quote_interval_secs=QUOTING_INTERVAL_SECS,
         target_symbols=None,

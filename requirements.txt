@@ -1,3 +1,5 @@
 requests
 sseclient
 pandas
+python-dotenv
+python-dotenv
