@@ -17,10 +17,14 @@ Key design choices:
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Lock, Thread
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -63,6 +67,8 @@ HIT_THRESHOLD_TICKS = 3.0
 
 # Don't re-hit same product within this window (SSE fires on every book change)
 HIT_COOLDOWN_SECS = 10.0
+HIT_MIN_CONFIDENCE = 0.25
+HIT_POS_LIMIT_FRAC = 0.6
 
 # LON_ETF arb: minimum profit in ticks to trigger
 ARB_TRIGGER_TICKS = 5.0
@@ -71,6 +77,14 @@ DATA_REFRESH_INTERVAL_SECS = 60     # weather + tides
 QUOTING_INTERVAL_SECS = 5
 
 SESSION_HOURS = 24
+INVENTORY_SOFT_LIMIT_FRAC = 0.8
+SESSION_START_HOUR = 14
+SESSION_START_MINUTE = 30
+LONDON_TZ = ZoneInfo("Europe/London")
+MID_FILTER_DEBUG = True
+MID_FILTER_DEBUG_EVERY_N = 25
+STATE_SAVE_INTERVAL_SECS = 10.0
+STATE_FILE_TEMPLATE = ".alpha_bot_state_{username}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +97,14 @@ def _safe_mid(ob: OrderBook) -> float | None:
     if bids and asks:
         return (max(bids) + min(asks)) / 2.0
     return None
+
+
+def _book_level_counts(ob: OrderBook) -> tuple[int, int, int, int]:
+    total_bids = len(ob.buy_orders)
+    total_asks = len(ob.sell_orders)
+    filtered_bids = sum(1 for o in ob.buy_orders if o.volume - o.own_volume > 0)
+    filtered_asks = sum(1 for o in ob.sell_orders if o.volume - o.own_volume > 0)
+    return total_bids, total_asks, filtered_bids, filtered_asks
 
 
 def _best_bid(ob: OrderBook) -> float | None:
@@ -107,6 +129,45 @@ def _blend(model: float | None, market: float | None, model_weight: float) -> fl
         return model
     w = max(0.0, min(0.9, model_weight))   # floor: 10% to market always
     return w * model + (1.0 - w) * market
+
+
+def _side_volume(pos: int, max_pos: int, side: Side) -> int:
+    """Inventory-aware size: reduce size when trading further into risk."""
+    if max_pos <= 0:
+        return 0
+
+    if side == Side.BUY:
+        remaining = max_pos - pos
+        push_frac = max(0.0, pos / max_pos)
+    else:
+        remaining = max_pos + pos
+        push_frac = max(0.0, -pos / max_pos)
+
+    if remaining <= 0:
+        return 0
+
+    scale = max(0.2, 1.0 - push_frac)
+    sized = max(1, math.ceil(QUOTE_VOLUME * scale))
+    return int(min(QUOTE_VOLUME, sized, remaining))
+
+
+def current_time(tzinfo) -> datetime:
+    """Centralized wall-clock access for consistent time handling."""
+    return datetime.now(tz=tzinfo)
+
+
+def resolve_session_start(now_dt: datetime | None = None) -> datetime:
+    """Derive the most recent London session start at HH:MM."""
+    now_london = now_dt or current_time(LONDON_TZ)
+    candidate = now_london.replace(
+        hour=SESSION_START_HOUR,
+        minute=SESSION_START_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if now_london < candidate:
+        candidate -= timedelta(days=1)
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +217,11 @@ class AlphaBot(BaseBot):
         self._flights_w2: dict | None = None   # session_start+12h → session_end
 
         self._products: dict[str, any] = {}
+        self._mid_debug_counts: dict[str, int] = {}
+        safe_user = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in username)
+        self._state_path = Path(STATE_FILE_TEMPLATE.format(username=safe_user))
+        self._state_dirty = False
+        self._last_state_save = time.monotonic()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -165,9 +231,9 @@ class AlphaBot(BaseBot):
         print("AlphaBot starting...")
         self._products = {p.symbol: p for p in self.get_products()}
         print(f"Products: {list(self._products.keys())}")
+        self._load_state()
 
         self.start()   # SSE stream → on_orderbook / on_trades
-        self._refresh_all_data()
 
         Thread(target=self._data_loop, daemon=True).start()
 
@@ -176,6 +242,7 @@ class AlphaBot(BaseBot):
         except KeyboardInterrupt:
             print("\nShutting down...")
         finally:
+            self._save_state(force=True)
             self.cancel_all_orders()
             self.stop()
             print("AlphaBot stopped.")
@@ -187,14 +254,42 @@ class AlphaBot(BaseBot):
     def on_orderbook(self, ob: OrderBook) -> None:
         """Cache orderbook + market mid; instantly hit obvious mispricings."""
         mid = _safe_mid(ob)
+        total_bids, total_asks, filtered_bids, filtered_asks = _book_level_counts(ob)
+        raw_best_bid = max((o.price for o in ob.buy_orders), default=None)
+        raw_best_ask = min((o.price for o in ob.sell_orders), default=None)
+        filt_best_bid = _best_bid(ob)
+        filt_best_ask = _best_ask(ob)
         tick = 1.0
+        pos = 0
+        max_pos = MAX_POSITION.get(ob.product, 50)
+        conf = 0.0
+        debug_count = 0
         with self._lock:
             self._orderbooks[ob.product] = ob          # ← cache full book
             if mid is not None:
                 self._market_mids[ob.product] = mid
+                self._state_dirty = True
             p = self._products.get(ob.product)
             if p:
                 tick = p.tickSize
+            pos = self._positions.get(ob.product, 0)
+            max_pos = MAX_POSITION.get(ob.product, 50)
+            conf = self._fv_estimate.confidence.get(ob.product, 0.0)
+            debug_count = self._mid_debug_counts.get(ob.product, 0) + 1
+            self._mid_debug_counts[ob.product] = debug_count
+
+        if MID_FILTER_DEBUG and (mid is None or debug_count % MID_FILTER_DEBUG_EVERY_N == 0):
+            mid_str = "n/a" if mid is None else f"{mid:.1f}"
+            raw_bid_str = "n/a" if raw_best_bid is None else f"{raw_best_bid:.1f}"
+            raw_ask_str = "n/a" if raw_best_ask is None else f"{raw_best_ask:.1f}"
+            filt_bid_str = "n/a" if filt_best_bid is None else f"{filt_best_bid:.1f}"
+            filt_ask_str = "n/a" if filt_best_ask is None else f"{filt_best_ask:.1f}"
+            print(
+                f"[MID FILTER] {ob.product} #{debug_count} "
+                f"levels(raw bid/ask={total_bids}/{total_asks}, filtered={filtered_bids}/{filtered_asks}) "
+                f"top(raw={raw_bid_str}/{raw_ask_str}, filtered={filt_bid_str}/{filt_ask_str}) "
+                f"mid={mid_str}"
+            )
 
         live_fv = self._compute_live_fv()
         fv = live_fv.get(ob.product)
@@ -206,37 +301,44 @@ class AlphaBot(BaseBot):
         # Cooldown: don't hit same product repeatedly as SSE fires on every book change
         if now - self._last_hit.get(ob.product, 0) < HIT_COOLDOWN_SECS:
             return
+        if conf < HIT_MIN_CONFIDENCE:
+            return
 
         best_ask = _best_ask(ob)
         if best_ask is not None and fv - best_ask >= HIT_THRESHOLD_TICKS * tick:
-            pos = self._positions.get(ob.product, 0)
-            max_pos = MAX_POSITION.get(ob.product, 50)
-            if pos < max_pos:
-                vol = min(QUOTE_VOLUME, max_pos - pos)
-                result = self.send_order(OrderRequest(ob.product, best_ask, Side.BUY, vol))
-                if result:
-                    self._last_hit[ob.product] = now
-                    print(f"[HIT BUY]  {ob.product}: {vol}@{best_ask:.0f}  live_FV={fv:.1f}")
+            if pos < max_pos * HIT_POS_LIMIT_FRAC:
+                vol = _side_volume(pos, max_pos, Side.BUY)
+                if vol > 0:
+                    result = self.send_order(OrderRequest(ob.product, best_ask, Side.BUY, vol))
+                    if result:
+                        self._last_hit[ob.product] = now
+                        print(f"[HIT BUY]  {ob.product}: {vol}@{best_ask:.0f}  live_FV={fv:.1f}")
 
         best_bid = _best_bid(ob)
         if best_bid is not None and best_bid - fv >= HIT_THRESHOLD_TICKS * tick:
-            pos = self._positions.get(ob.product, 0)
-            max_pos = MAX_POSITION.get(ob.product, 50)
-            if pos > -max_pos:
-                vol = min(QUOTE_VOLUME, max_pos + pos)
-                result = self.send_order(OrderRequest(ob.product, best_bid, Side.SELL, vol))
-                if result:
-                    self._last_hit[ob.product] = now
-                    print(f"[HIT SELL] {ob.product}: {vol}@{best_bid:.0f}  live_FV={fv:.1f}")
+            if pos > -max_pos * HIT_POS_LIMIT_FRAC:
+                vol = _side_volume(pos, max_pos, Side.SELL)
+                if vol > 0:
+                    result = self.send_order(OrderRequest(ob.product, best_bid, Side.SELL, vol))
+                    if result:
+                        self._last_hit[ob.product] = now
+                        print(f"[HIT SELL] {ob.product}: {vol}@{best_bid:.0f}  live_FV={fv:.1f}")
 
     def on_trades(self, trade: Trade) -> None:
-        side = "BOUGHT" if trade.buyer == self.username else "SOLD"
-        sign = +1 if side == "BOUGHT" else -1
+        if trade.buyer == self.username:
+            side = "BOUGHT"
+            sign = +1
+        elif trade.seller == self.username:
+            side = "SOLD"
+            sign = -1
+        else:
+            return
         print(f"  FILL: {side} {trade.volume}x {trade.product} @ {trade.price:.1f}")
         with self._lock:
             self._positions[trade.product] = (
                 self._positions.get(trade.product, 0) + sign * trade.volume
             )
+            self._state_dirty = True
 
     # ------------------------------------------------------------------
     # Fair value: blend model + live market data
@@ -246,7 +348,7 @@ class AlphaBot(BaseBot):
         """0.0 early in session → 1.0 at settlement (noon Sunday).
         Ramps linearly over the final 6 hours before settlement.
         """
-        now = datetime.now(tz=self._settlement_dt.tzinfo)
+        now = current_time(self._settlement_dt.tzinfo)
         hours_left = (self._settlement_dt - now).total_seconds() / 3600
         if hours_left <= 0:
             return 1.0
@@ -354,6 +456,7 @@ class AlphaBot(BaseBot):
             )
             with self._lock:
                 self._fv_estimate = fv_est
+                self._state_dirty = True
         except Exception as e:
             print(f"[DATA] Fair value computation failed: {e}")
             return
@@ -365,7 +468,7 @@ class AlphaBot(BaseBot):
         """Fetch flights in two 12h windows. Each window fetched only once."""
         fmt = "%Y-%m-%dT%H:%M"
         session_mid = self._session_start + timedelta(hours=12)
-        now = datetime.now(tz=self._session_start.tzinfo)
+        now = current_time(self._session_start.tzinfo)
 
         # Window 1: session_start → session_start+12h (fetch immediately, once)
         if self._flights_w1 is None:
@@ -379,6 +482,7 @@ class AlphaBot(BaseBot):
                 arr = len(self._flights_w1.get("arrivals", []))
                 dep = len(self._flights_w1.get("departures", []))
                 print(f"[DATA] Window 1: {arr} arr, {dep} dep")
+                self._state_dirty = True
             except Exception as e:
                 print(f"[DATA] Flight window 1 failed: {e}")
 
@@ -394,6 +498,7 @@ class AlphaBot(BaseBot):
                 arr = len(self._flights_w2.get("arrivals", []))
                 dep = len(self._flights_w2.get("departures", []))
                 print(f"[DATA] Window 2: {arr} arr, {dep} dep")
+                self._state_dirty = True
             except Exception as e:
                 print(f"[DATA] Flight window 2 failed: {e}")
 
@@ -434,6 +539,7 @@ class AlphaBot(BaseBot):
                 with self._lock:
                     self._positions = live_positions
                     model = self._fv_estimate
+                    self._state_dirty = True
 
                 live_fv = self._compute_live_fv()
 
@@ -445,6 +551,7 @@ class AlphaBot(BaseBot):
             except Exception as e:
                 print(f"[QUOTE ERROR] {e}")
 
+            self._save_state()
             time.sleep(QUOTING_INTERVAL_SECS)
 
     def _requote_product(
@@ -455,7 +562,7 @@ class AlphaBot(BaseBot):
         model: FairValueEstimate,
     ):
         fv = live_fv.get(symbol)
-        if not fv or fv <= 0:
+        if fv is None or fv <= 0:
             return
 
         tick = product.tickSize
@@ -488,10 +595,12 @@ class AlphaBot(BaseBot):
             return
 
         orders: list[OrderRequest] = []
-        if pos < max_pos * 0.8:
-            orders.append(OrderRequest(symbol, bid, Side.BUY, QUOTE_VOLUME))
-        if pos > -max_pos * 0.8:
-            orders.append(OrderRequest(symbol, ask, Side.SELL, QUOTE_VOLUME))
+        buy_vol = _side_volume(pos, max_pos, Side.BUY)
+        sell_vol = _side_volume(pos, max_pos, Side.SELL)
+        if pos < max_pos * INVENTORY_SOFT_LIMIT_FRAC and buy_vol > 0:
+            orders.append(OrderRequest(symbol, bid, Side.BUY, buy_vol))
+        if pos > -max_pos * INVENTORY_SOFT_LIMIT_FRAC and sell_vol > 0:
+            orders.append(OrderRequest(symbol, ask, Side.SELL, sell_vol))
 
         if not orders:
             return
@@ -511,6 +620,7 @@ class AlphaBot(BaseBot):
             sides_str = " / ".join(f"{o.volume}@{o.price:.0f} {o.side}" for o in orders)
             print(f"  [QUOTE] {symbol:<12} live_FV={fv:.1f}  spread=±{spread:.1f}  {sides_str}")
             self._last_quoted_fv[symbol] = fv
+            self._state_dirty = True
 
     # ------------------------------------------------------------------
     # LON_ETF Arbitrage — uses SSE-cached orderbooks (no API calls)
@@ -578,23 +688,109 @@ class AlphaBot(BaseBot):
         else:
             print("[ARB] Skipped: position limit on one or more legs")
 
+    # ------------------------------------------------------------------
+    # Local state persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self):
+        if not self._state_path.exists():
+            return
+        try:
+            with self._state_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[STATE] Load failed: {e}")
+            return
+
+        if data.get("session_start") != self._session_start.isoformat():
+            print("[STATE] Session changed; ignoring previous persisted state")
+            return
+
+        try:
+            positions = {k: int(v) for k, v in data.get("positions", {}).items()}
+            last_quoted_fv = {k: float(v) for k, v in data.get("last_quoted_fv", {}).items()}
+            market_mids = {k: float(v) for k, v in data.get("market_mids", {}).items()}
+            fv_data = data.get("fv_estimate", {})
+            fv = {k: float(v) for k, v in fv_data.get("fv", {}).items()}
+            conf = {k: float(v) for k, v in fv_data.get("confidence", {}).items()}
+
+            with self._lock:
+                self._positions.update(positions)
+                self._last_quoted_fv.update(last_quoted_fv)
+                self._market_mids.update(market_mids)
+                self._flights_w1 = data.get("flights_w1")
+                self._flights_w2 = data.get("flights_w2")
+                if fv or conf:
+                    self._fv_estimate = FairValueEstimate(
+                        fv=fv,
+                        confidence=conf,
+                        last_data_update=time.monotonic(),
+                    )
+                self._state_dirty = False
+
+            print(
+                f"[STATE] Restored mids={len(market_mids)} "
+                f"fv={len(fv)} flights={'yes' if self._flights_w1 or self._flights_w2 else 'no'}"
+            )
+        except Exception as e:
+            print(f"[STATE] Invalid state format: {e}")
+
+    def _save_state(self, force: bool = False):
+        with self._lock:
+            if not force:
+                if not self._state_dirty:
+                    return
+                if time.monotonic() - self._last_state_save < STATE_SAVE_INTERVAL_SECS:
+                    return
+
+            payload = {
+                "version": 1,
+                "saved_at": datetime.now(tz=self._session_start.tzinfo).isoformat(),
+                "session_start": self._session_start.isoformat(),
+                "positions": dict(self._positions),
+                "last_quoted_fv": dict(self._last_quoted_fv),
+                "market_mids": dict(self._market_mids),
+                "fv_estimate": {
+                    "fv": dict(self._fv_estimate.fv),
+                    "confidence": dict(self._fv_estimate.confidence),
+                },
+                "flights_w1": self._flights_w1,
+                "flights_w2": self._flights_w2,
+            }
+
+        try:
+            tmp_path = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, separators=(",", ":"), ensure_ascii=True)
+            tmp_path.replace(self._state_path)
+            with self._lock:
+                self._state_dirty = False
+                self._last_state_save = time.monotonic()
+        except Exception as e:
+            print(f"[STATE] Save failed: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import pytz
-
-    EXCHANGE_URL    = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-    # EXCHANGE_URL  = "REPLACE_WITH_CHALLENGE_URL"
+    # EXCHANGE_URL    = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
+    EXCHANGE_URL  = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/"
 
     USERNAME        = "Stack_Overslept"
     PASSWORD        = "JKVM2026"
+    # USERNAME = "jingloo-test"
+    # PASSWORD = "JingCMI123"
     AERODATABOX_KEY = "07ee7d05eamshc9db0bf5c17f962p13157ejsn762d96e7aa7e"
 
-    london_tz     = pytz.timezone("Europe/London")
-    SESSION_START = london_tz.localize(datetime(2026, 3, 1, 14, 30, 0))
+    session_start_env = os.getenv("SESSION_START")
+    if session_start_env:
+        SESSION_START = datetime.fromisoformat(session_start_env)
+        if SESSION_START.tzinfo is None:
+            SESSION_START = SESSION_START.replace(tzinfo=LONDON_TZ)
+    else:
+        SESSION_START = resolve_session_start()
 
     bot = AlphaBot(
         cmi_url=EXCHANGE_URL,

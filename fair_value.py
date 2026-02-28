@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -33,9 +34,11 @@ import requests
 # ---------------------------------------------------------------------------
 
 LONDON_LAT, LONDON_LON = 51.5074, -0.1278
+LONDON_TZ = ZoneInfo("Europe/London")
 THAMES_MEASURE = "0006-level-tidal_level-i-15_min-mAOD"
 AERODATABOX_HOST = "aerodatabox.p.rapidapi.com"
 AIRPORT = "LHR"
+SESSION_HOURS = 24
 
 # Settlement time: 12:00 London time (Europe/London)
 SETTLEMENT_HOUR = 12
@@ -43,6 +46,23 @@ SETTLEMENT_MINUTE = 0
 
 # LON_FLY option strikes
 FLY_STRIKES = {"put1": 6200, "call1": 6200, "call2": 6600, "call3": 7000}
+
+
+def current_time(tz=timezone.utc) -> datetime:
+    """Centralized wall-clock access for consistent time handling."""
+    return datetime.now(tz=tz)
+
+
+def next_settlement_noon(now_dt: datetime) -> datetime:
+    next_noon = now_dt.replace(
+        hour=SETTLEMENT_HOUR,
+        minute=SETTLEMENT_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if next_noon <= now_dt:
+        next_noon += timedelta(days=1)
+    return next_noon
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +111,7 @@ def get_weather(past_steps: int = 96, forecast_steps: int = 96) -> pd.DataFrame:
             "forecast_minutely_15": forecast_steps,
             "timezone": "Europe/London",
         },
-        timeout=15,
+        timeout=(5, 30),
     )
     resp.raise_for_status()
     m = resp.json()["minutely_15"]
@@ -151,10 +171,8 @@ def project_tide_at_noon(tidal_df: pd.DataFrame) -> tuple[float, float]:
     t = df["t_hours"].values
 
     # Compute next settlement time
-    now_london = datetime.now(tz=df["time"].iloc[-1].tzinfo)
-    next_noon = now_london.replace(hour=SETTLEMENT_HOUR, minute=SETTLEMENT_MINUTE, second=0, microsecond=0)
-    if next_noon <= now_london:
-        next_noon += timedelta(days=1)
+    now_london = current_time(df["time"].iloc[-1].tzinfo)
+    next_noon = next_settlement_noon(now_london)
 
     last_obs_time = df["time"].iloc[-1]
     hours_to_noon = (next_noon - last_obs_time).total_seconds() / 3600.0
@@ -261,6 +279,10 @@ def fetch_flights(
     offset_minutes: Start of window relative to now (negative = past).
     duration_minutes: Window length in minutes (max 720 = 12h).
     """
+    if not isinstance(api_key, str):
+        raise TypeError(f"api_key must be str, got {type(api_key).__name__}")
+    if not isinstance(airport, str):
+        raise TypeError(f"airport must be str, got {type(airport).__name__}")
     params = f"?offsetMinutes={offset_minutes}&durationMinutes={duration_minutes}&direction=Both"
     url = f"https://{AERODATABOX_HOST}/flights/airports/iata/{airport}{params}"
     resp = requests.get(
@@ -275,10 +297,28 @@ def fetch_flights(
 def fetch_flights_range(
     api_key: str,
     airport: str = AIRPORT,
-    from_local: str = "2026-02-28T12:00",
-    to_local: str = "2026-02-29T00:00",
+    from_local: str | None = None,
+    to_local: str | None = None,
 ) -> dict:
-    """Fetch flights by explicit local time range (max 12h span)."""
+    """Fetch flights by explicit local time range (max 12h span).
+
+    If omitted, defaults to [now-6h, now+6h] in Europe/London.
+    """
+    if not isinstance(api_key, str):
+        raise TypeError(f"api_key must be str, got {type(api_key).__name__}")
+    if not isinstance(airport, str):
+        raise TypeError(f"airport must be str, got {type(airport).__name__}")
+    if from_local is None or to_local is None:
+        now_local = current_time(LONDON_TZ)
+        default_from = now_local - timedelta(hours=6)
+        default_to = now_local + timedelta(hours=6)
+        from_local = from_local or default_from.strftime("%Y-%m-%dT%H:%M")
+        to_local = to_local or default_to.strftime("%Y-%m-%dT%H:%M")
+    if not isinstance(from_local, str):
+        raise TypeError(f"from_local must be str, got {type(from_local).__name__}")
+    if not isinstance(to_local, str):
+        raise TypeError(f"to_local must be str, got {type(to_local).__name__}")
+
     url = f"https://{AERODATABOX_HOST}/flights/airports/iata/{airport}/{from_local}/{to_local}?direction=Both"
     resp = requests.get(
         url,
@@ -302,57 +342,69 @@ def compute_flight_estimates(
     arrivals = flights_data.get("arrivals", [])
     departures = flights_data.get("departures", [])
 
-    # Total observed
-    observed_total = len(arrivals) + len(departures)
+    total_session_hours = max(1.0, (session_end - session_start).total_seconds() / 3600)
 
-    # Estimate flights per hour from observed data
-    total_session_hours = (session_end - session_start).total_seconds() / 3600
-    now_utc = datetime.now(timezone.utc)
-    elapsed_hours = max(0.1, (now_utc - session_start.astimezone(timezone.utc)).total_seconds() / 3600)
-    elapsed_hours = min(elapsed_hours, total_session_hours)
-    remaining_hours = total_session_hours - elapsed_hours
-
-    # Flights per hour rate
-    flights_per_hour = observed_total / elapsed_hours if elapsed_hours > 0 else 18.0  # LHR ~18/hr typical
-    estimated_remaining = flights_per_hour * remaining_hours
-    lhr_count_estimate = observed_total + estimated_remaining
-
-    # Confidence: increases as session progresses
-    lhr_count_confidence = min(1.0, elapsed_hours / total_session_hours)
-
-    # LHR_INDEX: compute from 30-min windows
-    # Group arrivals and departures into 30-min buckets
+    # Parse flight timestamp from preferred fields, robust to missing keys.
     def parse_time(flight: dict) -> Optional[datetime]:
         for key in ["movement", "departure", "arrival"]:
-            if key in flight:
-                for t_key in ["scheduledTimeLocal", "actualTimeLocal", "revisedTimeLocal"]:
-                    val = flight[key].get(t_key)
-                    if val:
-                        try:
-                            return pd.to_datetime(val).to_pydatetime()
-                        except Exception:
-                            continue
+            section = flight.get(key)
+            if not isinstance(section, dict):
+                continue
+            for t_key in ["scheduledTimeLocal", "actualTimeLocal", "revisedTimeLocal"]:
+                val = section.get(t_key)
+                if not val:
+                    continue
+                try:
+                    ts = pd.to_datetime(val).to_pydatetime()
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=session_start.tzinfo)
+                    return ts
+                except Exception:
+                    continue
         return None
 
-    # Build 30-min bins
+    def in_session(ts: datetime) -> bool:
+        return session_start <= ts <= session_end
+
+    arr_times = [t for f in arrivals if (t := parse_time(f)) is not None and in_session(t)]
+    dep_times = [t for f in departures if (t := parse_time(f)) is not None and in_session(t)]
+    observed_total = len(arr_times) + len(dep_times)
+
+    # Coverage-based extrapolation (instead of elapsed-time), avoids early-session blowups.
+    all_times = sorted(arr_times + dep_times)
+    if all_times:
+        coverage_start = max(session_start, all_times[0])
+        coverage_end = min(session_end, all_times[-1])
+        coverage_hours = max(0.5, (coverage_end - coverage_start).total_seconds() / 3600)
+    else:
+        coverage_hours = 0.5
+
+    if observed_total > 0:
+        flights_per_hour = observed_total / coverage_hours
+        flights_per_hour = min(150.0, max(20.0, flights_per_hour))
+        remaining_hours = max(0.0, total_session_hours - coverage_hours)
+        lhr_count_estimate = observed_total + flights_per_hour * remaining_hours
+    else:
+        lhr_count_estimate = 400.0
+
+    coverage_frac = max(0.0, min(1.0, coverage_hours / total_session_hours))
+    lhr_count_confidence = max(0.1, coverage_frac)
+
+    # LHR_INDEX from observed 30-min bins.
     bins: dict[str, dict[str, int]] = {}
 
-    def add_to_bin(t: Optional[datetime], kind: str):
-        if t is None:
-            return
-        # Round down to 30-min boundary
-        minute_bucket = (t.minute // 30) * 30
-        bin_key = t.strftime(f"%Y-%m-%d %H:") + f"{minute_bucket:02d}"
+    def add_to_bin(ts: datetime, kind: str):
+        minute_bucket = (ts.minute // 30) * 30
+        bin_key = ts.strftime("%Y-%m-%d %H:") + f"{minute_bucket:02d}"
         if bin_key not in bins:
             bins[bin_key] = {"arr": 0, "dep": 0}
         bins[bin_key][kind] += 1
 
-    for flight in arrivals:
-        add_to_bin(parse_time(flight), "arr")
-    for flight in departures:
-        add_to_bin(parse_time(flight), "dep")
+    for ts in arr_times:
+        add_to_bin(ts, "arr")
+    for ts in dep_times:
+        add_to_bin(ts, "dep")
 
-    # Compute index from observed bins
     index_sum = 0.0
     for b in bins.values():
         arr, dep = b["arr"], b["dep"]
@@ -361,9 +413,9 @@ def compute_flight_estimates(
             index_sum += (arr - dep) / total
 
     lhr_index_estimate = abs(index_sum) * 100
-    lhr_index_confidence = lhr_count_confidence * 0.8  # slightly less certain than count
+    lhr_index_confidence = max(0.1, lhr_count_confidence * 0.8)
 
-    return lhr_count_estimate, lhr_count_confidence, lhr_index_estimate, lhr_index_confidence
+    return float(lhr_count_estimate), lhr_count_confidence, lhr_index_estimate, lhr_index_confidence
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +456,7 @@ def compute_all_fair_values(
 
     Returns FairValueEstimate with fv and confidence for each product.
     """
-    session_end = session_start + timedelta(hours=24)
+    session_end = session_start + timedelta(hours=SESSION_HOURS)
     est = FairValueEstimate()
 
     # -- TIDE_SPOT --
@@ -470,10 +522,8 @@ def _compute_wx_spot(weather_df: pd.DataFrame) -> float:
         return 4000.0  # rough default
 
     now_tz = weather_df["time"].iloc[0].tzinfo
-    today = datetime.now(tz=now_tz)
-    next_noon = today.replace(hour=12, minute=0, second=0, microsecond=0)
-    if next_noon <= today:
-        next_noon += timedelta(days=1)
+    today = current_time(now_tz)
+    next_noon = next_settlement_noon(today)
 
     next_noon_ts = pd.Timestamp(next_noon)
     idx = (weather_df["time"] - next_noon_ts).abs().idxmin()
@@ -515,12 +565,10 @@ def _weather_confidence(
         return 0.1
 
     now_tz = weather_df["time"].iloc[0].tzinfo
-    now = datetime.now(tz=now_tz)
+    now = current_time(now_tz)
 
     # Next settlement noon
-    next_noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
-    if next_noon <= now:
-        next_noon += timedelta(days=1)
+    next_noon = next_settlement_noon(now)
 
     hours_to_noon = (next_noon - now).total_seconds() / 3600
 
@@ -535,10 +583,10 @@ def _weather_confidence(
         else:
             return 0.50
     else:
-        # Sum: confidence = fraction of session already observed (elapsed / 22h session)
-        # Use absolute timestamps to handle midnight crossover correctly
-        _start = session_start if session_start is not None else now.replace(hour=14, minute=30, second=0, microsecond=0)
-        session_hours = 22.0   # 14:30 Saturday → 12:30 Sunday
-        elapsed = (now - _start).total_seconds() / 3600
+        # Sum: confidence = fraction of 24h session already observed.
+        if session_start is None:
+            return 0.3
+        elapsed = (now - session_start).total_seconds() / 3600
+        session_hours = float(SESSION_HOURS)
         observed_frac = max(0.0, min(1.0, elapsed / session_hours))
         return max(0.3, observed_frac)

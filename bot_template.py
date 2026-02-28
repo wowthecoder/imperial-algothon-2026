@@ -23,6 +23,11 @@ import requests
 import sseclient
 
 STANDARD_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
+# SSE debug controls (set once here; no environment variables needed)
+SSE_DEBUG = False
+SSE_DEBUG_MAX_CHARS = 320
+SSE_DEBUG_EVERY_N = 1
+SSE_DEBUG_RAW_LINES = False
 
 
 class DictLikeFrozenDataclassMapping(Mapping):
@@ -129,6 +134,7 @@ class _SSEThread(Thread):
         self._http_stream: requests.Response | None = None
         self._client: sseclient.SSEClient | None = None
         self._closed = False
+        self._debug_event_count = 0
 
     def run(self):
         while not self._closed:
@@ -146,7 +152,11 @@ class _SSEThread(Thread):
         if self._http_stream:
             self._http_stream.close()
         if self._client:
-            self._client.close()
+            # sseclient 0.0.27 has no close(); close underlying response instead.
+            if hasattr(self._client, "close"):
+                self._client.close()
+            elif hasattr(self._client, "resp"):
+                self._client.resp.close()
 
     def _consume(self):
         headers = {
@@ -154,17 +164,115 @@ class _SSEThread(Thread):
             "Accept": "text/event-stream; charset=utf-8",
         }
         self._http_stream = requests.get(self._url, stream=True, headers=headers, timeout=30)
-        self._client = sseclient.SSEClient(self._http_stream)
+        self._http_stream.raise_for_status()
+        self._client = None
 
-        for event in self._client.events():
-            if event.event == "order":
-                self._on_order_event(json.loads(event.data))
-            elif event.event == "trade":
-                data = json.loads(event.data)
-                trades = data if isinstance(data, list) else [data]
-                trade_fields = {f.name for f in Trade.__dataclass_fields__.values()}
-                for t in trades:
+        event_name = "message"
+        data_lines: list[str] = []
+
+        def flush_event() -> None:
+            nonlocal event_name, data_lines
+            self._debug_event_count += 1
+            do_debug = SSE_DEBUG and (self._debug_event_count % SSE_DEBUG_EVERY_N == 0)
+            raw_data = "\n".join(data_lines).strip()
+            if do_debug:
+                preview = raw_data.replace("\n", "\\n")[:SSE_DEBUG_MAX_CHARS] if raw_data else "<empty>"
+                print(
+                    f"[SSE DEBUG] #{self._debug_event_count} event={event_name!r} "
+                    f"data_len={len(raw_data)} preview={preview}"
+                )
+            if not raw_data:
+                event_name = "message"
+                data_lines = []
+                return
+
+            try:
+                payload = json.loads(raw_data)
+            except json.JSONDecodeError:
+                if do_debug:
+                    print("[SSE DEBUG] JSON decode failed; skipping frame")
+                event_name = "message"
+                data_lines = []
+                return
+
+            event_name_l = event_name.strip().lower()
+            is_order_payload = (
+                isinstance(payload, dict)
+                and "productsymbol" in payload
+                and "buyOrders" in payload
+                and "sellOrders" in payload
+            )
+            if do_debug:
+                if isinstance(payload, dict):
+                    keys_preview = list(payload.keys())[:8]
+                    print(f"[SSE DEBUG] payload=dict keys={keys_preview}")
+                elif isinstance(payload, list):
+                    print(f"[SSE DEBUG] payload=list len={len(payload)}")
+                else:
+                    print(f"[SSE DEBUG] payload_type={type(payload).__name__}")
+
+            if event_name_l == "order" or is_order_payload:
+                if isinstance(payload, dict):
+                    if do_debug:
+                        print("[SSE DEBUG] dispatch=orderbook")
+                    self._on_order_event(payload)
+                event_name = "message"
+                data_lines = []
+                return
+
+            trades = payload if isinstance(payload, list) else [payload]
+            trade_fields = set(Trade.__dataclass_fields__.keys())
+            valid_trades = [
+                t for t in trades
+                if isinstance(t, dict) and {"timestamp", "product", "buyer", "seller", "volume", "price"} <= set(t.keys())
+            ]
+            if event_name_l == "trade" or valid_trades:
+                if do_debug:
+                    print(f"[SSE DEBUG] dispatch=trade count={len(valid_trades)}")
+                for t in valid_trades:
                     self._handle_trade_event(Trade(**{k: v for k, v in t.items() if k in trade_fields}))
+                event_name = "message"
+                data_lines = []
+                return
+
+            if do_debug:
+                print("[SSE DEBUG] dispatch=ignored (unknown payload shape)")
+            event_name = "message"
+            data_lines = []
+
+        for raw_line in self._http_stream.iter_lines(decode_unicode=True):
+            if self._closed:
+                break
+
+            line = raw_line.rstrip("\r") if isinstance(raw_line, str) else ""
+            if SSE_DEBUG and SSE_DEBUG_RAW_LINES and line:
+                print(f"[SSE DEBUG RAW] {line[:SSE_DEBUG_MAX_CHARS]}")
+
+            # Empty line terminates one SSE event.
+            if line == "":
+                flush_event()
+                continue
+
+            # Comment/heartbeat
+            if line.startswith(":"):
+                continue
+
+            field, sep, value = line.partition(":")
+            field_l = field.strip().lower()
+            if sep and value.startswith(" "):
+                value = value[1:]
+
+            if field_l == "event":
+                event_name = value.strip() or "message"
+            elif field_l == "data":
+                data_lines.append(value)
+            elif not sep and line[:1] in "{[":
+                # Non-standard stream: raw JSON line with no "data:" prefix.
+                data_lines.append(line)
+
+        # If stream closes without trailing blank line, flush buffered payload.
+        if data_lines:
+            flush_event()
 
     def _on_order_event(self, data: dict[str, Any]):
         buy_orders = sorted(
@@ -189,6 +297,8 @@ class BaseBot(ABC):
     """
 
     def __init__(self, cmi_url: str, username: str, password: str):
+        if not isinstance(cmi_url, str):
+            raise TypeError(f"cmi_url must be a string URL, got {type(cmi_url).__name__}")
         self._cmi_url = cmi_url.rstrip("/")
         self.username = username
         self._password = password
