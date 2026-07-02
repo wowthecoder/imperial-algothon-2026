@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock, Thread
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -37,6 +38,8 @@ from fair_value import (
     get_thames,
     get_weather,
     lon_fly_payoff,
+    lon_fly_expected_payoff,
+    lon_fly_expected_delta,
 )
 
 load_dotenv()
@@ -59,10 +62,13 @@ MAX_POSITION: dict[str, int] = {
     "LHR_COUNT": 0,      # Group A — disabled
     "LHR_INDEX": 50,     # Group D — increased from 30
     "LON_ETF":   0,      # Group A — disabled
-    "LON_FLY":   30,     # Group E — increased from 20
+    "LON_FLY":   12,     # Group E — reduced for safety (nonlinear payoff risk)
 }
 
 QUOTE_VOLUME = 5
+# High-confidence volume boost: when conf > 0.7, quote up to this many lots
+HIGH_CONF_QUOTE_VOLUME = 9
+HIGH_CONF_THRESHOLD = 0.70
 
 # Spread half-width (ticks): narrow at high confidence, wide at low
 MIN_SPREAD_TICKS = 2.0
@@ -75,7 +81,7 @@ REQUOTE_THRESHOLD_TICKS = 1.0
 HIT_THRESHOLD_TICKS = 2.0
 
 # Don't re-hit same product within this window (SSE fires on every book change)
-HIT_COOLDOWN_SECS = 10.0
+HIT_COOLDOWN_SECS = 4.0  # reduced from 10.0 — capture mispricings faster
 HIT_MIN_CONFIDENCE = 0.20
 HIT_POS_LIMIT_FRAC = 0.6
 
@@ -89,7 +95,13 @@ TRAP_VOLUME = 5                          # contracts per trap level
 TRAP_REFRESH_INTERVAL_SECS = 300        # re-place every 5 minutes
 
 DATA_REFRESH_INTERVAL_SECS = 60     # weather + tides
-QUOTING_INTERVAL_SECS = 5
+QUOTING_INTERVAL_SECS = 3           # reduced from 5 for higher throughput
+
+# LON_FLY delta hedging: max LON_ETF units held as hedge (|delta| ≤ 2 × max_fly_pos = 24)
+MAX_HEDGE_ETF_POS = 24
+
+# LON_FLY arb: minimum seconds between arb attempts (arb is reactive via SSE)
+FLY_ARB_COOLDOWN_SECS = 5.0
 
 SESSION_HOURS = 24
 INVENTORY_SOFT_LIMIT_FRAC = 0.8
@@ -146,7 +158,7 @@ def _blend(model: float | None, market: float | None, model_weight: float) -> fl
     return w * model + (1.0 - w) * market
 
 
-def _side_volume(pos: int, max_pos: int, side: Side) -> int:
+def _side_volume(pos: int, max_pos: int, side: Side, max_volume: int = QUOTE_VOLUME) -> int:
     """Inventory-aware size: reduce size when trading further into risk."""
     if max_pos <= 0:
         return 0
@@ -162,8 +174,8 @@ def _side_volume(pos: int, max_pos: int, side: Side) -> int:
         return 0
 
     scale = max(0.2, 1.0 - push_frac)
-    sized = max(1, math.ceil(QUOTE_VOLUME * scale))
-    return int(min(QUOTE_VOLUME, sized, remaining))
+    sized = max(1, math.ceil(max_volume * scale))
+    return int(min(max_volume, sized, remaining))
 
 
 def current_time(tzinfo) -> datetime:
@@ -235,6 +247,7 @@ class AlphaBot(BaseBot):
         self._mid_debug_counts: dict[str, int] = {}
         self._trap_orders: dict[str, list[str]] = {}   # product → [order_id, ...]
         self._last_trap_placed: float = 0.0            # monotonic time of last trap refresh
+        self._last_fly_arb: float = 0.0                # cooldown for LON_FLY arb attempts
         safe_user = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in username)
         self._state_path = Path(STATE_FILE_TEMPLATE.format(username=safe_user))
         self._state_dirty = False
@@ -343,6 +356,11 @@ class AlphaBot(BaseBot):
             )
 
         live_fv = self._compute_live_fv()
+
+        # React instantly to LON_FLY/LON_ETF book changes for arb detection
+        if ob.product in ("LON_FLY", "LON_ETF"):
+            self._check_fly_arb()
+
         fv = live_fv.get(ob.product)
         if fv is None:
             return
@@ -461,7 +479,11 @@ class AlphaBot(BaseBot):
 
         if blended_etf is not None:
             live["LON_ETF"] = blended_etf
-            live["LON_FLY"] = lon_fly_payoff(blended_etf)
+            # Use distribution-aware expected payoff for LON_FLY.
+            # ETF std estimated from model confidence: low confidence → high uncertainty.
+            etf_conf_raw = model.confidence.get("LON_ETF", 0.3)
+            etf_std = max(50.0, blended_etf * 0.15 * (1.0 - etf_conf_raw))
+            live["LON_FLY"] = lon_fly_expected_payoff(blended_etf, etf_std)
 
         return live
 
@@ -525,11 +547,14 @@ class AlphaBot(BaseBot):
         if self._flights_w1 is None:
             try:
                 print("[DATA] Fetching flight window 1 (first 12h)...")
-                self._flights_w1 = fetch_flights_range(
+                raw_w1 = fetch_flights_range(
                     api_key=self._aero_api_key,
                     from_local=self._session_start.strftime(fmt),
                     to_local=session_mid.strftime(fmt),
                 )
+                self._flights_w1 = self._compact_flights_payload(raw_w1) or {
+                    "arrivals": [], "departures": []
+                }
                 arr = len(self._flights_w1.get("arrivals", []))
                 dep = len(self._flights_w1.get("departures", []))
                 print(f"[DATA] Window 1: {arr} arr, {dep} dep")
@@ -541,17 +566,121 @@ class AlphaBot(BaseBot):
         if self._flights_w2 is None and now >= session_mid:
             try:
                 print("[DATA] Fetching flight window 2 (second 12h)...")
-                self._flights_w2 = fetch_flights_range(
+                raw_w2 = fetch_flights_range(
                     api_key=self._aero_api_key,
                     from_local=session_mid.strftime(fmt),
                     to_local=self._session_end.strftime(fmt),
                 )
+                self._flights_w2 = self._compact_flights_payload(raw_w2) or {
+                    "arrivals": [], "departures": []
+                }
                 arr = len(self._flights_w2.get("arrivals", []))
                 dep = len(self._flights_w2.get("departures", []))
                 print(f"[DATA] Window 2: {arr} arr, {dep} dep")
                 self._state_dirty = True
             except Exception as e:
                 print(f"[DATA] Flight window 2 failed: {e}")
+
+    def _extract_flight_time(self, flight: dict[str, Any], stem: str) -> str | None:
+        """Extract timestamp string from multiple AeroDataBox payload shapes."""
+        if stem not in {"scheduled", "revised", "actual"}:
+            return None
+        for section_key in ("movement", "departure", "arrival"):
+            section = flight.get(section_key)
+            if not isinstance(section, dict):
+                continue
+            # Shape A: movement.scheduledTime.local / .utc
+            nested = section.get(f"{stem}Time")
+            if isinstance(nested, dict):
+                val = nested.get("local") or nested.get("utc")
+                if isinstance(val, str) and val:
+                    return val
+            # Shape B: movement.scheduledTimeLocal
+            flat = (
+                section.get(f"{stem}TimeLocal")
+                or section.get(f"{stem}TimeUTC")
+                or section.get(f"{stem}TimeUtc")
+            )
+            if isinstance(flat, str) and flat:
+                return flat
+        return None
+
+    def _compact_flight_entry(self, flight: dict[str, Any]) -> dict[str, Any] | None:
+        """Keep only flight fields used by fair value logic."""
+        if not isinstance(flight, dict):
+            return None
+
+        movement: dict[str, str] = {}
+        for stem in ("scheduled", "revised", "actual"):
+            t = self._extract_flight_time(flight, stem)
+            if t is not None:
+                movement[f"{stem}TimeLocal"] = t
+
+        if not movement:
+            return None
+
+        # Drop entries that are clearly outside this session window.
+        ref_t = (
+            movement.get("revisedTimeLocal")
+            or movement.get("actualTimeLocal")
+            or movement.get("scheduledTimeLocal")
+        )
+        if ref_t is not None:
+            try:
+                ts = pd.to_datetime(ref_t).to_pydatetime()
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=self._session_start.tzinfo)
+                if ts < self._session_start or ts > self._session_end:
+                    return None
+            except Exception:
+                pass
+
+        compact: dict[str, Any] = {"movement": movement}
+        for k in ("number", "status", "codeshareStatus"):
+            v = flight.get(k)
+            if isinstance(v, str) and v:
+                compact[k] = v
+        return compact
+
+    def _compact_flights_payload(self, flights: dict | None) -> dict | None:
+        """Normalize and compact flights payload to avoid oversized state files."""
+        if not isinstance(flights, dict):
+            return None
+
+        out: dict[str, list[dict[str, Any]]] = {"arrivals": [], "departures": []}
+        for side in ("arrivals", "departures"):
+            items = flights.get(side, [])
+            if not isinstance(items, list):
+                continue
+            seen: set[tuple[str | None, str | None, str | None, str | None]] = set()
+            compact_items: list[dict[str, Any]] = []
+            for f in items:
+                cf = self._compact_flight_entry(f)
+                if cf is None:
+                    continue
+                m = cf.get("movement", {})
+                dedupe_key = (
+                    cf.get("number"),
+                    m.get("scheduledTimeLocal"),
+                    m.get("revisedTimeLocal"),
+                    cf.get("status"),
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                compact_items.append(cf)
+
+            compact_items.sort(
+                key=lambda x: (
+                    (x.get("movement", {}) or {}).get("scheduledTimeLocal", ""),
+                    x.get("number", ""),
+                )
+            )
+            out[side] = compact_items
+
+        if not out["arrivals"] and not out["departures"]:
+            return None
+        return out
 
     def _merged_flights(self) -> dict | None:
         """Combine both flight windows into one dict."""
@@ -598,6 +727,8 @@ class AlphaBot(BaseBot):
                     self._requote_product(symbol, product, live_fv, model)
 
                 self._check_etf_arb()
+                self._check_fly_arb()
+                self._hedge_lon_fly()
 
                 now = time.monotonic()
                 if now - self._last_trap_placed >= TRAP_REFRESH_INTERVAL_SECS:
@@ -632,12 +763,19 @@ class AlphaBot(BaseBot):
         conf = min(1.0, model.confidence.get(symbol, 0.5) + prox * 0.3)
         base_spread = MAX_SPREAD_TICKS - conf * (MAX_SPREAD_TICKS - MIN_SPREAD_TICKS)
 
-        # Widen if model and live disagree (extra uncertainty)
+        # Widen if model and live disagree (extra uncertainty), scaled by (1-conf)
+        # so disagreement penalty vanishes as confidence rises
         if model_fv is not None:
-            extra = min(abs(fv - model_fv) / tick * 0.5, 10.0)
+            extra = min(abs(fv - model_fv) / tick * 0.5 * (1.0 - conf), 10.0)
         else:
-            extra = 5.0
+            extra = 5.0 * (1.0 - conf)
         spread = base_spread + extra
+
+        # Gamma-aware spread widening for LON_FLY near option strikes
+        if symbol == "LON_FLY":
+            etf_fv_for_gamma = live_fv.get("LON_ETF")
+            if etf_fv_for_gamma is not None:
+                spread += self._fly_gamma_spread_adjustment(etf_fv_for_gamma)
 
         # Skip requote if FV barely moved (preserve queue priority)
         last_fv = self._last_quoted_fv.get(symbol)
@@ -647,19 +785,48 @@ class AlphaBot(BaseBot):
         pos     = self._positions.get(symbol, 0)
         max_pos = MAX_POSITION.get(symbol, 50)
 
-        bid = math.floor((fv - spread * tick) / tick) * tick
-        ask = math.ceil( (fv + spread * tick) / tick) * tick
+        # Inventory skew: shift quotes toward flattening by up to 2 ticks
+        # (long position → lower both bid & ask to sell more aggressively, etc.)
+        inventory_skew = (pos / max_pos) * 2.0 * tick if max_pos > 0 else 0.0
+
+        bid = math.floor((fv - spread * tick - inventory_skew) / tick) * tick
+        ask = math.ceil( (fv + spread * tick - inventory_skew) / tick) * tick
 
         if bid <= 0 or bid >= ask:
             return
 
         orders: list[OrderRequest] = []
-        buy_vol = _side_volume(pos, max_pos, Side.BUY)
-        sell_vol = _side_volume(pos, max_pos, Side.SELL)
+        # Use higher volume when confidence is high
+        q_vol = HIGH_CONF_QUOTE_VOLUME if conf >= HIGH_CONF_THRESHOLD else QUOTE_VOLUME
+        buy_vol = _side_volume(pos, max_pos, Side.BUY, q_vol)
+        sell_vol = _side_volume(pos, max_pos, Side.SELL, q_vol)
         if pos < max_pos * INVENTORY_SOFT_LIMIT_FRAC and buy_vol > 0:
             orders.append(OrderRequest(symbol, bid, Side.BUY, buy_vol))
         if pos > -max_pos * INVENTORY_SOFT_LIMIT_FRAC and sell_vol > 0:
             orders.append(OrderRequest(symbol, ask, Side.SELL, sell_vol))
+
+        # LON_FLY deep inventory flattening: when |pos| > 50% of max, post an
+        # aggressive flattening order near the market mid to speed up unwinding.
+        if symbol == "LON_FLY" and max_pos > 0 and abs(pos) > max_pos * 0.5:
+            with self._lock:
+                ob = self._orderbooks.get(symbol)
+            if ob is not None:
+                if pos > 0:
+                    # Long: post an extra sell 1 tick above current bid
+                    best_b = _best_bid(ob)
+                    if best_b is not None:
+                        flatten_price = best_b + tick
+                        flatten_vol = min(3, pos)
+                        orders.append(OrderRequest(symbol, flatten_price, Side.SELL, flatten_vol))
+                        print(f"  [FLATTEN] {symbol}: extra SELL {flatten_vol}@{flatten_price:.0f} (pos={pos})")
+                else:
+                    # Short: post an extra buy 1 tick below current ask
+                    best_a = _best_ask(ob)
+                    if best_a is not None:
+                        flatten_price = best_a - tick
+                        flatten_vol = min(3, -pos)
+                        orders.append(OrderRequest(symbol, flatten_price, Side.BUY, flatten_vol))
+                        print(f"  [FLATTEN] {symbol}: extra BUY {flatten_vol}@{flatten_price:.0f} (pos={pos})")
 
         if not orders:
             return
@@ -680,6 +847,99 @@ class AlphaBot(BaseBot):
             print(f"  [QUOTE] {symbol:<12} live_FV={fv:.1f}  spread=±{spread:.1f}  {sides_str}")
             self._last_quoted_fv[symbol] = fv
             self._state_dirty = True
+
+    # ------------------------------------------------------------------
+    # LON_FLY helpers: gamma spread, arb, delta hedging
+    # ------------------------------------------------------------------
+
+    def _fly_gamma_spread_adjustment(self, etf_fv: float) -> float:
+        """Widen LON_FLY spread when ETF is near option strikes (high gamma zones)."""
+        strikes = [6200, 6600, 7000]
+        min_dist = min(abs(etf_fv - k) for k in strikes)
+        # Within 100 of a strike → add up to 5 extra ticks of spread
+        if min_dist < 100:
+            return 5.0 * (1.0 - min_dist / 100.0)
+        return 0.0
+
+    def _check_fly_arb(self):
+        """Arb LON_FLY against its theoretical value implied by LON_ETF mid."""
+        now = time.monotonic()
+        if now - self._last_fly_arb < FLY_ARB_COOLDOWN_SECS:
+            return
+
+        with self._lock:
+            fly_ob = self._orderbooks.get("LON_FLY")
+            etf_ob = self._orderbooks.get("LON_ETF")
+
+        if fly_ob is None or etf_ob is None:
+            return
+
+        etf_mid = _safe_mid(etf_ob)
+        if etf_mid is None:
+            return
+
+        theo_fly = lon_fly_payoff(etf_mid)
+        fly_ask = _best_ask(fly_ob)
+        fly_bid = _best_bid(fly_ob)
+
+        pos = self._positions.get("LON_FLY", 0)
+        max_pos = MAX_POSITION["LON_FLY"]
+
+        if fly_ask is not None and theo_fly - fly_ask > 5:
+            if pos < max_pos:
+                vol = min(3, max_pos - pos)
+                self.send_order(OrderRequest("LON_FLY", fly_ask, Side.BUY, vol))
+                self._last_fly_arb = now
+                print(f"[FLY ARB] BUY {vol}@{fly_ask} (theo={theo_fly:.0f}, edge={theo_fly-fly_ask:.0f})")
+
+        if fly_bid is not None and fly_bid - theo_fly > 5:
+            if pos > -max_pos:
+                vol = min(3, max_pos + pos)
+                self.send_order(OrderRequest("LON_FLY", fly_bid, Side.SELL, vol))
+                self._last_fly_arb = now
+                print(f"[FLY ARB] SELL {vol}@{fly_bid} (theo={theo_fly:.0f}, edge={fly_bid-theo_fly:.0f})")
+
+    def _hedge_lon_fly(self):
+        """Delta-hedge LON_FLY position using LON_ETF."""
+        fly_pos = self._positions.get("LON_FLY", 0)
+        if fly_pos == 0:
+            return
+
+        live_fv = self._compute_live_fv()
+        etf_fv = live_fv.get("LON_ETF")
+        if etf_fv is None:
+            return
+
+        etf_conf = self._fv_estimate.confidence.get("LON_ETF", 0.3)
+        etf_std = max(50.0, etf_fv * 0.15 * (1.0 - etf_conf))
+        delta = lon_fly_expected_delta(etf_fv, etf_std)
+
+        fly_etf_delta = fly_pos * delta
+        etf_pos = self._positions.get("LON_ETF", 0)
+
+        # Desired hedge: offset the fly delta, capped to MAX_HEDGE_ETF_POS
+        raw_target = -round(fly_etf_delta)
+        target_etf_pos = max(-MAX_HEDGE_ETF_POS, min(MAX_HEDGE_ETF_POS, raw_target))
+        hedge_needed = target_etf_pos - etf_pos
+
+        if abs(hedge_needed) < 1:
+            return
+
+        with self._lock:
+            ob = self._orderbooks.get("LON_ETF")
+        if ob is None:
+            return
+
+        if hedge_needed > 0:
+            ask = _best_ask(ob)
+            if ask:
+                self.send_order(OrderRequest("LON_ETF", ask, Side.BUY, abs(hedge_needed)))
+                print(f"[HEDGE] BUY {abs(hedge_needed)} LON_ETF @{ask} (fly delta={delta:.2f}, fly_pos={fly_pos})")
+        else:
+            bid = _best_bid(ob)
+            if bid:
+                self.send_order(OrderRequest("LON_ETF", bid, Side.SELL, abs(hedge_needed)))
+                print(f"[HEDGE] SELL {abs(hedge_needed)} LON_ETF @{bid} (fly delta={delta:.2f}, fly_pos={fly_pos})")
 
     # ------------------------------------------------------------------
     # LON_ETF Arbitrage — uses SSE-cached orderbooks (no API calls)
@@ -841,8 +1101,9 @@ class AlphaBot(BaseBot):
                 self._positions.update(positions)
                 self._last_quoted_fv.update(last_quoted_fv)
                 self._market_mids.update(market_mids)
-                self._flights_w1 = data.get("flights_w1")
-                self._flights_w2 = data.get("flights_w2")
+                # Compact legacy/full payloads on load so future saves stay small.
+                self._flights_w1 = self._compact_flights_payload(data.get("flights_w1"))
+                self._flights_w2 = self._compact_flights_payload(data.get("flights_w2"))
                 if fv or conf:
                     self._fv_estimate = FairValueEstimate(
                         fv=fv,
@@ -859,27 +1120,39 @@ class AlphaBot(BaseBot):
             print(f"[STATE] Invalid state format: {e}")
 
     def _save_state(self, force: bool = False):
+        compact_w1: dict | None = None
+        compact_w2: dict | None = None
         with self._lock:
             if not force:
                 if not self._state_dirty:
                     return
                 if time.monotonic() - self._last_state_save < STATE_SAVE_INTERVAL_SECS:
                     return
+            positions = dict(self._positions)
+            last_quoted_fv = dict(self._last_quoted_fv)
+            market_mids = dict(self._market_mids)
+            fv = dict(self._fv_estimate.fv)
+            conf = dict(self._fv_estimate.confidence)
+            flights_w1 = self._flights_w1
+            flights_w2 = self._flights_w2
 
-            payload = {
-                "version": 1,
-                "saved_at": datetime.now(tz=self._session_start.tzinfo).isoformat(),
-                "session_start": self._session_start.isoformat(),
-                "positions": dict(self._positions),
-                "last_quoted_fv": dict(self._last_quoted_fv),
-                "market_mids": dict(self._market_mids),
-                "fv_estimate": {
-                    "fv": dict(self._fv_estimate.fv),
-                    "confidence": dict(self._fv_estimate.confidence),
-                },
-                "flights_w1": self._flights_w1,
-                "flights_w2": self._flights_w2,
-            }
+        # Keep state compact: only persist fields used by the model.
+        compact_w1 = self._compact_flights_payload(flights_w1)
+        compact_w2 = self._compact_flights_payload(flights_w2)
+        payload = {
+            "version": 2,
+            "saved_at": datetime.now(tz=self._session_start.tzinfo).isoformat(),
+            "session_start": self._session_start.isoformat(),
+            "positions": positions,
+            "last_quoted_fv": last_quoted_fv,
+            "market_mids": market_mids,
+            "fv_estimate": {
+                "fv": fv,
+                "confidence": conf,
+            },
+            "flights_w1": compact_w1,
+            "flights_w2": compact_w2,
+        }
 
         try:
             tmp_path = self._state_path.with_suffix(self._state_path.suffix + ".tmp")

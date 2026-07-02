@@ -434,6 +434,40 @@ def lon_fly_payoff(etf_value: float) -> float:
     return 2 * put_6200 + call_6200 - 2 * call_6600 + 3 * call_7000
 
 
+def lon_fly_expected_payoff(etf_mean: float, etf_std: float, n_samples: int = 2000) -> float:
+    """Compute E[LON_FLY payoff] by integrating over ETF distribution.
+
+    Uses Jensen's inequality correction: because the payoff function is nonlinear
+    (kinked at strikes 6200, 6600, 7000), E[payoff(ETF)] != payoff(E[ETF]).
+    This Monte Carlo estimate gives a more accurate FV.
+
+    Args:
+        etf_mean: Blended ETF fair value estimate (point estimate)
+        etf_std:  Standard deviation representing ETF uncertainty
+        n_samples: Number of samples for Monte Carlo integration
+
+    Returns:
+        Expected LON_FLY settlement value
+    """
+    rng = np.random.default_rng(42)  # fixed seed for reproducibility
+    samples = rng.normal(etf_mean, etf_std, n_samples)
+    payoffs = np.vectorize(lon_fly_payoff)(samples)
+    return float(payoffs.mean())
+
+
+def lon_fly_delta(etf_value: float, bump: float = 1.0) -> float:
+    """Numerical delta of LON_FLY w.r.t. LON_ETF."""
+    return (lon_fly_payoff(etf_value + bump) - lon_fly_payoff(etf_value - bump)) / (2 * bump)
+
+
+def lon_fly_expected_delta(etf_mean: float, etf_std: float, n_samples: int = 2000) -> float:
+    """Expected delta under uncertainty about ETF settlement."""
+    rng = np.random.default_rng(42)
+    samples = rng.normal(etf_mean, etf_std, n_samples)
+    deltas = np.vectorize(lon_fly_delta)(samples)
+    return float(deltas.mean())
+
+
 # ---------------------------------------------------------------------------
 # Master fair value computation
 # ---------------------------------------------------------------------------
@@ -503,10 +537,20 @@ def compute_all_fair_values(
     est.fv["LON_ETF"] = etf_fv
     est.confidence["LON_ETF"] = etf_conf
 
-    # -- LON_FLY --
-    fly_fv = lon_fly_payoff(etf_fv)
+    # -- LON_FLY (distribution-aware via Jensen's inequality correction) --
+    # ETF uncertainty: propagate component uncertainties in quadrature.
+    # tide_spot, wx_spot, lhr_count each have their own confidence;
+    # low confidence ≈ high uncertainty. Use a rough std proxy: std ~ (1-conf) * value * 0.15
+    etf_std = np.sqrt(
+        (tide_spot * 0.15 * (1.0 - tide_conf)) ** 2
+        + (wx_spot_fv * 0.15 * (1.0 - wx_spot_conf)) ** 2
+        + (lhr_count * 0.10 * (1.0 - lhr_count_conf)) ** 2
+    )
+    etf_std = max(etf_std, 50.0)  # minimum floor std of 50 ETF points
+    fly_fv = lon_fly_expected_payoff(etf_fv, etf_std)
     est.fv["LON_FLY"] = fly_fv
-    est.confidence["LON_FLY"] = etf_conf * 0.8  # payoff is nonlinear, less certain
+    # Confidence penalised more aggressively: nonlinear payoff amplifies ETF uncertainty
+    est.confidence["LON_FLY"] = etf_conf * 0.5  # halved from 0.8 → more conservative
 
     est.last_data_update = time.monotonic()
     return est
